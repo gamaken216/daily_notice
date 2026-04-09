@@ -1,0 +1,15 @@
+# Google 認証ファイル（個人情報が含まれるため絶対にコミットしない）
+credentials.json
+token.json
+
+# アプリ設定ファイル（個人の設定のため除外）
+config.json
+
+# Python キャッシュ
+__pycache__/
+*.pyc
+*.pyo
+
+# OS 生成ファイル
+.DS_Store
+Thumbs.db
