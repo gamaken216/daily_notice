@@ -1,17 +1,17 @@
-# Daily Notice - タスクスケジューラー登録スクリプト
-# このスクリプトを管理者権限の PowerShell で実行してください
+# Daily Notice - Task Scheduler registration script
+# Run this script with PowerShell as Administrator
 
 $taskName = "DailyNotice"
 
-# このスクリプトが置かれているフォルダを自動取得
-$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+# Automatically get the folder where this script is located
+$scriptDir = $PSScriptRoot
 $scriptPath = Join-Path $scriptDir "daily_notice.py"
 
-# Python / pythonw のパスを自動取得
+# Automatically find Python / pythonw
 $pythonPath = (Get-Command python -ErrorAction Stop).Source
 $pythonwPath = $pythonPath -replace "python\.exe$", "pythonw.exe"
 
-# 既存タスクがあれば削除
+# Remove existing task if present
 Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
 
 $action   = New-ScheduledTaskAction -Execute $pythonwPath -Argument ('"' + $scriptPath + '"')
@@ -21,5 +21,5 @@ $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoi
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings `
     -Description "Daily Notice at PC startup"
 
-Write-Host "✅ タスクの登録が完了しました。次回ログオン時から自動起動します。" -ForegroundColor Green
-Write-Host "   スクリプトパス: $scriptPath" -ForegroundColor Cyan
+Write-Host "Task registered successfully. Auto-starts on next login." -ForegroundColor Green
+Write-Host "Script path: $scriptPath" -ForegroundColor Cyan
