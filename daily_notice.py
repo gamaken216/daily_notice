@@ -15,10 +15,13 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+import base64
+from email.mime.text import MIMEText
 
 SCOPES = [
     "https://www.googleapis.com/auth/calendar.readonly",
     "https://www.googleapis.com/auth/tasks.readonly",
+    "https://www.googleapis.com/auth/gmail.send",
 ]
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -26,6 +29,7 @@ CREDENTIALS_FILE = os.path.join(SCRIPT_DIR, "credentials.json")
 HOSTNAME = socket.gethostname()
 TOKEN_FILE = os.path.join(SCRIPT_DIR, f"token_{HOSTNAME}.json")
 CONFIG_FILE = os.path.join(SCRIPT_DIR, f"config_{HOSTNAME}.json")
+LAST_SENT_FILE = os.path.join(SCRIPT_DIR, "last_sent.json")  # 全PC共通: 最終送信日
 
 # ============================================================
 # 🎨 カラーパレット定義
@@ -361,6 +365,175 @@ def show_popup(events, tasks, palette_index, followups=None):
     root.mainloop()
 
 
+# ============================================================
+# 📧 メール送信機能（1日1通制御つき）
+# ============================================================
+
+EMAIL_RECIPIENT = "matsmoto.norihito@gmail.com"
+
+
+def is_already_sent_today():
+    """今日すでにメール送信済みかチェック"""
+    if not os.path.exists(LAST_SENT_FILE):
+        return False
+    try:
+        with open(LAST_SENT_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        last_date = data.get("last_sent_date", "")
+        today = datetime.date.today().isoformat()
+        return last_date == today
+    except Exception:
+        return False
+
+
+def mark_sent_today():
+    """今日送信したことを記録"""
+    today = datetime.date.today().isoformat()
+    data = {
+        "last_sent_date": today,
+        "sent_from_host": HOSTNAME,
+        "sent_at": datetime.datetime.now().isoformat(timespec="seconds"),
+    }
+    try:
+        with open(LAST_SENT_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"送信記録エラー: {e}", file=sys.stderr)
+
+
+def render_html_email(events, tasks, followups, palette):
+    """HTMLメール本文を生成"""
+    today = datetime.date.today()
+    weekday_jp = ["月", "火", "水", "木", "金", "土", "日"][today.weekday()]
+    today_str = f"{today.strftime('%Y年%m月%d日')}（{weekday_jp}）"
+
+    bg = palette["bg"]
+    fg = palette["fg"]
+    title_color = palette["title"]
+    accent = palette["btn_bg"]
+
+    html = f"""<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<style>
+body {{ font-family: 'Hiragino Sans', 'Yu Gothic', 'Meiryo', sans-serif; background-color: {bg}; color: {fg}; margin: 0; padding: 20px; }}
+.container {{ max-width: 600px; margin: 0 auto; background-color: {bg}; padding: 24px; border-radius: 12px; }}
+h1 {{ color: {title_color}; font-size: 22px; border-bottom: 3px solid {accent}; padding-bottom: 8px; margin-top: 0; }}
+h2 {{ color: {title_color}; font-size: 17px; margin-top: 28px; padding-left: 10px; border-left: 4px solid {accent}; }}
+h3 {{ color: #e5a00d; font-size: 15px; margin-top: 20px; margin-bottom: 6px; }}
+ul {{ list-style: none; padding-left: 0; margin: 8px 0; }}
+li {{ padding: 6px 0 6px 20px; position: relative; line-height: 1.6; }}
+li::before {{ content: "▸"; position: absolute; left: 0; color: {accent}; font-weight: bold; }}
+.empty {{ color: #888; font-style: italic; padding-left: 20px; }}
+.warning-section {{ background-color: rgba(229, 160, 13, 0.1); border-left: 4px solid #e5a00d; padding: 14px 18px; margin-top: 28px; border-radius: 6px; }}
+.meta {{ color: #888; font-size: 12px; margin-top: 32px; padding-top: 14px; border-top: 1px solid rgba(128,128,128,0.3); }}
+.task-list-name {{ color: {title_color}; font-weight: bold; margin-top: 14px; }}
+.due {{ color: #e5a00d; font-size: 13px; }}
+</style>
+</head>
+<body>
+<div class="container">
+<h1>📅 {today_str}</h1>
+"""
+
+    # カレンダー
+    html += '<h2>🗓️ 今日の予定</h2>'
+    if events:
+        html += '<ul>'
+        for ev in events:
+            summary = ev.get("summary", "(無題)")
+            start = ev.get("start", {})
+            if "dateTime" in start:
+                dt = datetime.datetime.fromisoformat(start["dateTime"].replace("Z", "+00:00"))
+                time_str = dt.strftime("%H:%M")
+                html += f'<li><strong>{time_str}</strong> &nbsp; {summary}</li>'
+            else:
+                html += f'<li><strong>終日</strong> &nbsp; {summary}</li>'
+        html += '</ul>'
+    else:
+        html += '<div class="empty">予定はありません</div>'
+
+    # タスク
+    html += '<h2>✅ ToDoリスト</h2>'
+    if tasks:
+        # リスト名でグループ化
+        from collections import defaultdict
+        grouped = defaultdict(list)
+        for task in tasks:
+            grouped[task.get("_list_name", "未分類")].append(task)
+        for list_name, items in grouped.items():
+            html += f'<div class="task-list-name">{list_name}</div>'
+            html += '<ul>'
+            for task in items:
+                title = task.get("title", "(無題)")
+                due_str = ""
+                if task.get("due"):
+                    try:
+                        d = datetime.datetime.fromisoformat(task["due"].replace("Z", "+00:00"))
+                        due_str = f' <span class="due">(期限: {d.strftime("%m/%d")})</span>'
+                    except Exception:
+                        pass
+                html += f'<li>{title}{due_str}</li>'
+            html += '</ul>'
+    else:
+        html += '<div class="empty">タスクはありません</div>'
+
+    # Airtableフォローアップ
+    has_followups = any(items for items in followups.values()) if followups else False
+    if has_followups:
+        html += '<div class="warning-section">'
+        html += '<h2 style="margin-top:0; border:none; padding:0;">⚠ Ascom 要フォローアップ</h2>'
+        category_labels = {
+            "社内判断待ち": "【社内判断待ち】オファーが出たまま社内判断保留中",
+            "契約書未締結": "【契約書未締結】オファー受諾済みだが契約未締結",
+            "未入金":       "【未入金】契約書締結済みだが前払い未入金",
+        }
+        for key, label in category_labels.items():
+            items = followups.get(key, [])
+            if not items:
+                continue
+            html += f'<h3>{label}</h3><ul>'
+            for book, publisher, lang in items:
+                info = " / ".join(filter(None, [publisher, lang]))
+                if info:
+                    html += f'<li>{book} <span style="color:#888;font-size:13px;">（{info}）</span></li>'
+                else:
+                    html += f'<li>{book}</li>'
+            html += '</ul>'
+        html += '</div>'
+
+    html += f'<div class="meta">📍 送信元: {HOSTNAME} | 🕐 {datetime.datetime.now().strftime("%H:%M:%S")} 自動送信</div>'
+    html += '</div></body></html>'
+    return html
+
+
+def send_email(creds, events, tasks, followups, palette):
+    """Gmail APIで自分宛にHTMLメールを送信"""
+    today = datetime.date.today()
+    weekday_jp = ["月", "火", "水", "木", "金", "土", "日"][today.weekday()]
+    subject = f"【Daily Notice】{today.isoformat()} ({weekday_jp}) 今日のタスク・予定"
+
+    html_body = render_html_email(events, tasks, followups, palette)
+
+    message = MIMEText(html_body, "html", "utf-8")
+    message["to"] = EMAIL_RECIPIENT
+    message["from"] = EMAIL_RECIPIENT
+    message["subject"] = subject
+
+    raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
+
+    try:
+        service = build("gmail", "v1", credentials=creds)
+        service.users().messages().send(userId="me", body={"raw": raw}).execute()
+        print(f"✉️ メール送信完了: {EMAIL_RECIPIENT}")
+        mark_sent_today()
+        return True
+    except Exception as e:
+        print(f"メール送信エラー: {e}", file=sys.stderr)
+        return False
+
+
 def main():
     force_choose = "--choose-color" in sys.argv
     demo_mode    = "--demo" in sys.argv
@@ -389,6 +562,15 @@ def main():
     followups = get_airtable_followups(config)
 
     show_popup(events, tasks, palette_index, followups)
+
+    # ============================================================
+    # 📧 1日1通メール送信（demo時はスキップ、本日送信済みならスキップ）
+    # ============================================================
+    if not demo_mode and not is_already_sent_today():
+        try:
+            send_email(creds, events, tasks, followups, COLOR_PALETTES[palette_index])
+        except Exception as e:
+            print(f"メール送信処理エラー: {e}", file=sys.stderr)
 
 
 if __name__ == "__main__":
