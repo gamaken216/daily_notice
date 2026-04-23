@@ -1,13 +1,16 @@
-"""
+﻿"""
 PC起動時に今日のGoogleカレンダー予定とToDoリストをポップアップ表示するスクリプト
 """
 
 import os
 import sys
 import json
+import socket
 import datetime
 import tkinter as tk
 from tkinter import scrolledtext
+import urllib.request
+import urllib.parse
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -20,8 +23,9 @@ SCOPES = [
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CREDENTIALS_FILE = os.path.join(SCRIPT_DIR, "credentials.json")
-TOKEN_FILE = os.path.join(SCRIPT_DIR, "token.json")
-CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
+HOSTNAME = socket.gethostname()
+TOKEN_FILE = os.path.join(SCRIPT_DIR, f"token_{HOSTNAME}.json")
+CONFIG_FILE = os.path.join(SCRIPT_DIR, f"config_{HOSTNAME}.json")
 
 # ============================================================
 # 🎨 カラーパレット定義
@@ -168,6 +172,71 @@ def format_time(event):
     return "終日"
 
 
+def get_airtable_followups(config):
+    """Airtableの版権管理テーブルからフォローアップの案件を取得する"""
+    token = config.get("airtable_token", "")
+    base_id = config.get("airtable_base_id", "")
+    table_id = config.get("airtable_table_id", "")
+    if not token or not base_id or not table_id:
+        return {}
+
+    # フィールドID
+    fld_book = "fld9s7dffl6y45Ivh"          # 書籍名（multipleLookupValues）
+    fld_publisher = "fldMD5l4sCptEIFyQ"     # 海外出版社またはエージェント（singleLineText）
+    fld_lang = "fld63md3EQb2jDzwf"          # 言語（multipleSelects）
+    fld_status = "fldfy0QSYNGn3bcDu"        # ステータス（singleSelect）
+
+    # 抽出条件:
+    # 1. ステータス="オファー" → 社内判断待ち
+    # 2. ステータス="オファー受諾" → 契約書未締結
+    # 3. ステータス="契約書締結" AND 受取前払金金額=BLANK AND 前払金入金日=BLANK → 未入金
+    formula = (
+        'OR('
+        '{ステータス}="オファー",'
+        '{ステータス}="オファー受諾",'
+        'AND({ステータス}="契約書締結",{受取前払金金額}=BLANK(),{前払金入金日}=BLANK())'
+        ')'
+    )
+
+    params = urllib.parse.urlencode({
+        "filterByFormula": formula,
+        "fields[]": [fld_book, fld_publisher, fld_lang, fld_status],
+    }, doseq=True)
+
+    url = f"https://api.airtable.com/v0/{base_id}/{table_id}?{params}"
+    req = urllib.request.Request(url, headers={
+        "Authorization": f"Bearer {token}",
+    })
+
+    # カテゴリ別に分類
+    categories = {
+        "社内判断待ち": [],
+        "契約書未締結": [],
+        "未入金":       [],
+    }
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        for record in data.get("records", []):
+            fields = record.get("fields", {})
+            book_raw = fields.get("書籍名", [])
+            book = str(book_raw[0]) if isinstance(book_raw, list) and book_raw else "(不明)"
+            publisher = fields.get("海外出版社またはエージェント", "")
+            lang_raw = fields.get("言語", [])
+            lang = ", ".join(item["name"] if isinstance(item, dict) else str(item) for item in lang_raw) if lang_raw else ""
+            status = fields.get("ステータス", "")
+            if status == "オファー":
+                categories["社内判断待ち"].append((book, publisher, lang))
+            elif status == "オファー受諾":
+                categories["契約書未締結"].append((book, publisher, lang))
+            elif status == "契約書締結":
+                categories["未入金"].append((book, publisher, lang))
+    except Exception as e:
+        print(f"Airtable取得エラー: {e}", file=sys.stderr)
+
+    return categories
+
+
 def get_demo_events():
     today = datetime.date.today().isoformat()
     return [
@@ -188,8 +257,10 @@ def get_demo_tasks():
     ]
 
 
-def show_popup(events, tasks, palette_index):
+def show_popup(events, tasks, palette_index, followups=None):
     """メインポップアップ。palette_index を保持し、色変更時はウィジェットを再描画する。"""
+    if followups is None:
+        followups = {}
     today = datetime.date.today().strftime("%Y年%m月%d日(%a)")
     title_font   = ("Meiryo UI", 14, "bold")
     section_font = ("Meiryo UI", 12, "bold")
@@ -255,7 +326,31 @@ def show_popup(events, tasks, palette_index):
         else:
             text.insert("end", "  タスクはありません\n")
 
+        # Ascom 要フォローアップセクション（該当ありの場合のみ）
+        has_followups = any(items for items in followups.values())
+        if has_followups:
+            text.insert("end", "\n")
+            text.insert("end", "--- ⚠️ Ascom 要フォローアップ ---\n\n", "section_warn")
+            category_labels = {
+                "社内判断待ち": "【社内判断待ち】オファーが出たまま社内判断保留中",
+                "契約書未締結": "【契約書未締結】オファー受諾済みだが契約未締結",
+                "未入金":       "【未入金】契約書締結済みだが前払い未入金",
+            }
+            for key, label in category_labels.items():
+                items = followups.get(key, [])
+                if not items:
+                    continue
+                text.insert("end", f"{label}\n")
+                for book, publisher, lang in items:
+                    info = "／".join(filter(None, [publisher, lang]))
+                    if info:
+                        text.insert("end", f"  - {book}（{info}）\n")
+                    else:
+                        text.insert("end", f"  - {book}\n")
+                text.insert("end", "\n")
+
         text.tag_config("section", font=section_font, foreground=p["title"])
+        text.tag_config("section_warn", font=section_font, foreground="#e5a00d" if p["bg"].startswith("#1") or p["bg"].startswith("#0") or p["bg"] == "#2b2b2b" else "#b45309")
         text.configure(state="disabled")
 
         tk.Button(root, text="OK", command=root.destroy,
@@ -290,7 +385,10 @@ def main():
         events = get_calendar_events(creds)
         tasks  = get_tasks(creds)
 
-    show_popup(events, tasks, palette_index)
+    # Airtableフォローアップ取得
+    followups = get_airtable_followups(config)
+
+    show_popup(events, tasks, palette_index, followups)
 
 
 if __name__ == "__main__":
