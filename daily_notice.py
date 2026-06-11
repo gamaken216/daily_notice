@@ -5,6 +5,7 @@ PC起動時に今日のGoogleカレンダー予定とToDoリストをポップ�
 import os
 import sys
 import json
+import time
 import socket
 import datetime
 import tkinter as tk
@@ -148,11 +149,28 @@ def get_calendar_events(creds):
     now = datetime.datetime.now()
     start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat() + "+09:00"
     end_of_day   = now.replace(hour=23, minute=59, second=59, microsecond=0).isoformat() + "+09:00"
-    result = service.events().list(
-        calendarId="primary", timeMin=start_of_day, timeMax=end_of_day,
-        singleEvents=True, orderBy="startTime",
-    ).execute()
-    return result.get("items", [])
+
+    # 全カレンダーのIDを取得
+    calendar_list = service.calendarList().list().execute().get("items", [])
+
+    all_events = []
+    for cal in calendar_list:
+        cal_id = cal["id"]
+        result = service.events().list(
+            calendarId=cal_id, timeMin=start_of_day, timeMax=end_of_day,
+            singleEvents=True, orderBy="startTime",
+        ).execute()
+        all_events.extend(result.get("items", []))
+
+    # 開始時刻でソート（終日イベントは先頭に）
+    def sort_key(event):
+        start = event["start"].get("dateTime", "")
+        if start:
+            return (1, start)
+        return (0, event["start"].get("date", ""))
+
+    all_events.sort(key=sort_key)
+    return all_events
 
 
 def get_tasks(creds):
@@ -218,9 +236,21 @@ def get_airtable_followups(config):
         "契約書未締結": [],
         "未入金":       [],
     }
+    # 一過性のAPIエラー（タイムアウト・5xx等）対策: 最大3回リトライ（5秒間隔）
+    data = None
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            break
+        except Exception as e:
+            print(f"Airtable取得エラー（{attempt + 1}/3回目）: {e}", file=sys.stderr)
+            if attempt < 2:
+                time.sleep(5)
+    if data is None:
+        return categories
+
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
         for record in data.get("records", []):
             fields = record.get("fields", {})
             book_raw = fields.get("書籍名", [])
@@ -236,7 +266,7 @@ def get_airtable_followups(config):
             elif status == "契約書締結":
                 categories["未入金"].append((book, publisher, lang))
     except Exception as e:
-        print(f"Airtable取得エラー: {e}", file=sys.stderr)
+        print(f"Airtableレコード解析エラー: {e}", file=sys.stderr)
 
     return categories
 
@@ -526,8 +556,8 @@ def send_email(creds, events, tasks, followups, palette):
     try:
         service = build("gmail", "v1", credentials=creds)
         service.users().messages().send(userId="me", body={"raw": raw}).execute()
-        print(f"✉️ メール送信完了: {EMAIL_RECIPIENT}")
         mark_sent_today()
+        print(f"メール送信完了: {EMAIL_RECIPIENT}")
         return True
     except Exception as e:
         print(f"メール送信エラー: {e}", file=sys.stderr)
