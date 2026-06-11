@@ -207,6 +207,7 @@ def get_airtable_followups(config):
     fld_publisher = "fldMD5l4sCptEIFyQ"     # 海外出版社またはエージェント（singleLineText）
     fld_lang = "fld63md3EQb2jDzwf"          # 言語（multipleSelects）
     fld_status = "fldfy0QSYNGn3bcDu"        # ステータス（singleSelect）
+    fld_agent = "代理店"                     # 代理店（トークンにスキーマ読取権限がなくID不明のため名前指定）
 
     # 抽出条件:
     # 1. ステータス="オファー" → 社内判断待ち
@@ -222,7 +223,7 @@ def get_airtable_followups(config):
 
     params = urllib.parse.urlencode({
         "filterByFormula": formula,
-        "fields[]": [fld_book, fld_publisher, fld_lang, fld_status],
+        "fields[]": [fld_book, fld_publisher, fld_lang, fld_status, fld_agent],
     }, doseq=True)
 
     url = f"https://api.airtable.com/v0/{base_id}/{table_id}?{params}"
@@ -256,15 +257,16 @@ def get_airtable_followups(config):
             book_raw = fields.get("書籍名", [])
             book = str(book_raw[0]) if isinstance(book_raw, list) and book_raw else "(不明)"
             publisher = fields.get("海外出版社またはエージェント", "")
+            agent = fields.get("代理店", "")
             lang_raw = fields.get("言語", [])
             lang = ", ".join(item["name"] if isinstance(item, dict) else str(item) for item in lang_raw) if lang_raw else ""
             status = fields.get("ステータス", "")
             if status == "オファー":
-                categories["社内判断待ち"].append((book, publisher, lang))
+                categories["社内判断待ち"].append((book, agent, publisher, lang))
             elif status == "オファー受諾":
-                categories["契約書未締結"].append((book, publisher, lang))
+                categories["契約書未締結"].append((book, agent, publisher, lang))
             elif status == "契約書締結":
-                categories["未入金"].append((book, publisher, lang))
+                categories["未入金"].append((book, agent, publisher, lang))
     except Exception as e:
         print(f"Airtableレコード解析エラー: {e}", file=sys.stderr)
 
@@ -375,8 +377,8 @@ def show_popup(events, tasks, palette_index, followups=None):
                 if not items:
                     continue
                 text.insert("end", f"{label}\n")
-                for book, publisher, lang in items:
-                    info = "／".join(filter(None, [publisher, lang]))
+                for book, agent, publisher, lang in items:
+                    info = "／".join(filter(None, [agent, publisher, lang]))
                     if info:
                         text.insert("end", f"  - {book}（{info}）\n")
                     else:
@@ -524,8 +526,8 @@ li::before {{ content: "▸"; position: absolute; left: 0; color: {accent}; font
             if not items:
                 continue
             html += f'<h3>{label}</h3><ul>'
-            for book, publisher, lang in items:
-                info = " / ".join(filter(None, [publisher, lang]))
+            for book, agent, publisher, lang in items:
+                info = " / ".join(filter(None, [agent, publisher, lang]))
                 if info:
                     html += f'<li>{book} <span style="color:#888;font-size:13px;">（{info}）</span></li>'
                 else:
