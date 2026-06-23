@@ -211,12 +211,13 @@ def get_airtable_followups(config):
 
     # 抽出条件:
     # 1. ステータス="オファー" → 社内判断待ち
-    # 2. ステータス="オファー受諾" → 契約書未締結
+    # 2. ステータス="オファー受諾" または "ドラフト確認済" → 契約書未締結
     # 3. ステータス="契約書締結" AND 受取前払金金額=BLANK AND 前払金入金日=BLANK → 未入金
     formula = (
         'OR('
         '{ステータス}="オファー",'
         '{ステータス}="オファー受諾",'
+        '{ステータス}="ドラフト確認済",'
         'AND({ステータス}="契約書締結",{受取前払金金額}=BLANK(),{前払金入金日}=BLANK())'
         ')'
     )
@@ -263,7 +264,7 @@ def get_airtable_followups(config):
             status = fields.get("ステータス", "")
             if status == "オファー":
                 categories["社内判断待ち"].append((book, agent, publisher, lang))
-            elif status == "オファー受諾":
+            elif status in ("オファー受諾", "ドラフト確認済"):
                 categories["契約書未締結"].append((book, agent, publisher, lang))
             elif status == "契約書締結":
                 categories["未入金"].append((book, agent, publisher, lang))
